@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project>
+  <PropertyGroup>
+    <Authors>Open Ephys</Authors>
+    <Copyright>Copyright © Open Ephys and Contributors 2024</Copyright>
+    <PackageProjectUrl>https://open-ephys.github.io/bonsai-onix1-docs</PackageProjectUrl>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <IncludeSymbols>true</IncludeSymbols>
+    <RepositoryUrl>https://github.com/open-ephys/bonsai-onix1</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
+    <UseArtifactsOutput>true</UseArtifactsOutput>
+    <PackageIcon>icon.png</PackageIcon>
+    <VersionPrefix>0.4.3</VersionPrefix>
+    <VersionSuffix></VersionSuffix>
+    <LangVersion>10.0</LangVersion>
+    <Features>strict</Features>
+    <PackageType>Dependency;BonsaiLibrary</PackageType>
+  </PropertyGroup>
+
+  <Import Project="build/Version.props" />
+
+  <ItemGroup>
+    <Content Include="..\LICENSE" PackagePath="/" />
+    <Content Include="..\icon.png" PackagePath="/" />
+    <Content Include="..\README.md" PackagePath="/" />
+  </ItemGroup>
+</Project>
