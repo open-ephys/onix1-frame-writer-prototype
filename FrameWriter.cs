@@ -23,9 +23,14 @@ namespace FrameWriter
     [WorkflowElementCategory(ElementCategory.Sink)]
     public class FrameWriter
     {
-        public IObservable<Tsource> Process<Tsource>(IObservable<Tsource> source) // where Tsource : OpenEphys.Onix1.DataFrame //We need to create a common IOnixFrame or something that is a common ancestor of DataFrame and BufferedDataFrame
+        // We need to make it so this can only be used by classes inheriting from DataFrame and BufferedDataFrame.
+        // Easiest way, just a throw if the source is not, but it would be better if we could check at the signature
+        // level, so bonsai itself warned before pressing play
+        public IObservable<Tsource> Process<Tsource>(IObservable<Tsource> source) where Tsource : class
         {
-            PropertyInfo[] properties = typeof(Tsource).GetProperties(BindingFlags.Public | BindingFlags.Instance);
+            PropertyInfo[] properties = typeof(Tsource).GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                .Where(prop => prop.GetCustomAttribute(typeof(FrameWriterIgnoreAttribute)) == null)
+                .OrderBy(prop => prop.MetadataToken).ToArray();
 
             //prefetch this so it's faster later
             Expression[] writeDelegates = new Expression[properties.Length];
@@ -50,7 +55,19 @@ namespace FrameWriter
                 {
                     writeDelegate = GetMethodDelegate<Tsource>(method, property, inputParam);
                 }
-                if (method == null && (property.PropertyType.IsValueType || (property.PropertyType.IsArray && property.PropertyType.GetElementType().IsValueType)))
+                else if (property.GetCustomAttribute(typeof(FrameWriterSerializerAttribute)) is FrameWriterSerializerAttribute attr)
+                {
+                    var customMethod = property.DeclaringType.GetMethod(attr.SerializerMethod,
+                        BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public,
+                        null,
+                        new[] { property.PropertyType },
+                        null);
+                    if (customMethod != null)
+                    {
+                        writeDelegate = BuildCustomWriterExpression(property, inputParam, customMethod);
+                    }
+                }
+                else if (property.PropertyType.IsValueType || (property.PropertyType.IsArray && property.PropertyType.GetElementType().IsValueType))
                 {
                     writeDelegate = BuildWriterExpression(property, inputParam);
                 }
@@ -63,40 +80,83 @@ namespace FrameWriter
 
             var allDelegates = Expression.Block(writeDelegates);
             Action<Tsource> processParameters = Expression.Lambda<Action<Tsource>>(allDelegates, inputParam).Compile();
-            return source.Do(input =>
+            return source.Publish( elm => Observable.Merge(
+                elm.Take(1).Do(input => WriteHeader(input, properties)).IgnoreElements(), //NB: IgnoreElements prevents the first element to be repeated at the output
+                elm.Do(input =>
+                {
+                    //For performance we might want to put the input into a queue for another thread to pick it up, 
+                    // Update: Gonçalo suggesting this class inherits from StreamSink which would help.
+                    processParameters(input);
+                })
+               ));
+        }
+
+
+        // This is the method that will write the header or the schema in json, whatever we decide
+        // since it will be called only once, it is safe to use pure reflection here, isntead of building an
+        // expression tree, which would take more time for only a single execution
+        private void WriteHeader<T>(T  source, PropertyInfo[] properties) where T : class
+        {
+            Console.WriteLine("Frame type: " + typeof(T).ToString());
+            foreach (var property in properties)
             {
-                //For performance we might want to put the input into a queue for another thread to pick it up, 
-                //or we might want the 
-                processParameters(input);
-            });
+                string sizeStr;
+                var propertyType = property.PropertyType;
+                var propertyValue = property.GetValue(source, null);
+
+                //TODO: Do proper traversal. If the object is a struct, get the sizes of its members in hierarchical order, etc...
+                if (propertyType.IsArray)
+                {
+                    sizeStr = String.Join(",", Enumerable.Range(0, propertyType.GetArrayRank()).Select(i => (propertyValue as Array).GetLength(i).ToString()).ToArray());
+                }
+                else
+                {
+                    sizeStr = "1";
+                }
+                    Console.WriteLine("\t" + property.Name + ": " + propertyType + " [" + sizeStr + "]");
+            }
         }
 
         
         //This is the method that needs to connect to whatever thread and send them data. Every other type is already converted into byte[]
         // Note that ther might be a bunch of small arrays (for example a Quaternion is 4 arrays of size 4 (4 elements of sizeof(int) = 4 bytes)
         //So some buffering to write in chunks might be desirable, but that is to see.
+        // Update: Gonçalo suggesting this class inherits from StreamSink which would help.
         private void Write(byte[] data)
         {
-            Console.WriteLine(data.ToString() + ": " + data.Length);
+            Console.WriteLine(String.Join(",",data.Select(e => { return e.ToString(); }).ToArray()) + ": " + data.Length);
         }
 
-        //We need a void Write(OpenCv.pImage) that either converts it to a byte[] and forwards it to the prior method
-        //or sends it to write in its own format.
+        private Expression BuildCustomWriterExpression(PropertyInfo property, Expression input, MethodInfo customMethod)
+        {
+            Type type = property.PropertyType;
+            Expression propertyVal = Expression.Property(input, property);
+            var serialized = Expression.Call(null, customMethod, new[] { propertyVal });
+
+            Expression thisInstance = Expression.Constant(this);
+            MethodInfo writeMethd = this.GetType().GetMethod(nameof(Write), 
+                BindingFlags.NonPublic | BindingFlags.Instance,
+                null,
+                new[] { typeof(byte[]) },
+                null);
+
+            return Expression.Call(thisInstance, writeMethd, serialized);
+        }
 
         private Expression BuildWriterExpression(PropertyInfo property, Expression input)
         {
             Type type = property.PropertyType;
-            Expression instance = Expression.Property(input, property);
+            Expression propertyVal = Expression.Property(input, property);
 
             try
             {
                 if (type.IsArray)
                 {
-                    return BuildArrayWriter(type, instance);
+                    return BuildArrayWriter(type, propertyVal);
                 }
                 else
                 {
-                    return BuildStructWriter(type, instance);
+                    return BuildStructWriter(type, propertyVal);
                 }
             }
             catch
@@ -108,8 +168,8 @@ namespace FrameWriter
        private Expression BuildStructWriter(Type type, Expression instance)
         {
             var fields = type.GetFields(BindingFlags.Public | BindingFlags.Instance);
-            var properties = type.GetProperties(BindingFlags.Public | BindingFlags.Instance).Where(p => p.CanRead && p.GetIndexParameters().Length > 0);
-            var elements = fields.Cast<MemberInfo>().Concat(properties.Cast<MemberInfo>()).OrderBy(x => x.Name).ToArray();
+            var properties = type.GetProperties(BindingFlags.Public | BindingFlags.Instance).Where(p => p.CanRead);
+            var elements = fields.Cast<MemberInfo>().Concat(properties.Cast<MemberInfo>()).OrderBy(x => x.MetadataToken).ToArray();
 
             var bufferParam = Expression.Parameter(typeof(byte[]), "buffer");
             var thisInstance = Expression.Constant(this);
@@ -122,12 +182,8 @@ namespace FrameWriter
                     throw new InvalidOperationException();
                 }
 
-                Expression member = elements[i].MemberType switch
-                {
-                    MemberTypes.Property => Expression.Property(instance, (PropertyInfo)elements[i]),
-                    MemberTypes.Field => Expression.Field(instance, (FieldInfo)elements[i]),
-                    _ => throw new InvalidOperationException()
-                };
+                Expression member = GetMemberExpression(elements[i], instance);
+
                 if (typeof(IConvertible).IsAssignableFrom(elementType))
                 {
                     if (type.IsEnum)
@@ -141,7 +197,8 @@ namespace FrameWriter
                 }
                 else
                 {
-                    expressions[i] = BuildStructWriter(elementType,member);
+                    if (elementType.IsArray) expressions[i] = BuildArrayWriter(elementType, member);
+                    else expressions[i] = BuildStructWriter(elementType, member);
                 }
             }
             return Expression.Block(expressions);
@@ -171,11 +228,13 @@ namespace FrameWriter
             }
             else
             {
-                var method = ((Func<Type, Expression, Expression>)BuildStructWriter).Method;
+                var element = Expression.Parameter(elementType, "elm");
+                var method = BuildStructWriter(elementType, element);
                 var i = Expression.Parameter(typeof(int), "i");
                 var stopLabel = Expression.Label("stopLoop");
-                var body = Expression.Block(
-                    Expression.Call(thisInstance, method, Expression.ArrayIndex(instance, i)),
+                var body = Expression.Block(new[] { element },
+                    Expression.Assign(element, Expression.ArrayIndex(instance, i)),
+                    method,
                     Expression.PostIncrementAssign(i)
                     );
                 var condition = Expression.LessThan(i, Expression.ArrayLength(instance));
@@ -187,7 +246,7 @@ namespace FrameWriter
         }
         
         
-        private Expression GetMethodDelegate<Tsource> (MethodInfo method, PropertyInfo property, ParameterExpression inputParam)
+        private Expression GetMethodDelegate<Tsource> (MethodInfo method, PropertyInfo property, Expression inputParam)
         {
             var accessProperty = Expression.Property(inputParam, property);
             Type writeParamType = method.GetParameters()[0].ParameterType;
@@ -229,11 +288,21 @@ namespace FrameWriter
             };
         }
 
+        private static Expression GetMemberExpression(MemberInfo member, Expression instance)
+        {
+            return member.MemberType switch
+            {
+                MemberTypes.Property => Expression.Property(instance, (PropertyInfo)member),
+                MemberTypes.Field => Expression.Field(instance, (FieldInfo)member),
+                _ => throw new InvalidOperationException()
+            };
+        }
+
+
         private void WriteEnum(IConvertible data)
         {
             Write(Convert.ToInt64(data));
         }
-
 
 
         private void Write(Mat mat)
@@ -241,9 +310,15 @@ namespace FrameWriter
             Write(MatToArray(mat));
         }
 
+        //NB: This should handle other OpenCV classes such as lplImage in a standardized, binary-like way
+        private void Write(Arr cvArr)
+        {
+            Write(MatToArray(cvArr.GetMat()));
+        }
+
         
         
-        //This calls classes that implement IConvertible such as Uint64 Int16 etc... 
+        //NB: This calls classes that implement IConvertible such as Uint64 Int16 etc... 
         private void Write(IConvertible data)
         {
             dynamic dyndata = data;
@@ -251,7 +326,7 @@ namespace FrameWriter
         }
 
 
-        //Quick and dirty copy from Bonsai.Dsp.ArrHelper, since that class is private
+        //NB: Quick and dirty copy from Bonsai.Dsp.ArrHelper, since that class is private
         private static byte[] MatToArray(Mat input)
         {
             var step = input.ElementSize * input.Cols;
