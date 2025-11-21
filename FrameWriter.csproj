@@ -15,6 +15,7 @@
     <Features>strict</Features>
     <Version>0.1.0</Version>
     <Platforms>x64</Platforms>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>
